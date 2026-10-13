@@ -110,6 +110,16 @@ async def _conectar() -> AsyncIterator[aiosqlite.Connection]:
         await db.close()
 
 
+async def inicializar() -> None:
+    """Garante schema e seeds da base — boot do processo da API (T4).
+
+    As funções de acesso já inicializam lazy; esta é a porta explícita para
+    a subida do servidor deixar a base pronta antes da primeira requisição.
+    """
+    async with _conectar() as db:
+        await _inicializar(db)
+
+
 async def _popular_de_dados(db: aiosqlite.Connection) -> None:
     """Insere os seeds de ``dados/*.json``; transação fica a cargo do chamador."""
     reservas = json.loads(caminho_dados("reservas.json").read_text(encoding="utf-8"))

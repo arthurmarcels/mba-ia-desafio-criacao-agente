@@ -11,6 +11,9 @@ dependencies = [
     "uvicorn>=0.30",
     "aiosqlite>=0.20",
     "python-dotenv>=1.0",
+    # DatabaseSessionService (ADK) exige sqlalchemy async; o extra [db] do ADK
+    # arrastaria sqlalchemy-spanner — declaramos só o necessário.
+    "sqlalchemy[asyncio]>=2,<3",
 ]
 
 [project.scripts]

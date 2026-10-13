@@ -13,14 +13,14 @@ import argparse
 import asyncio
 import sys
 
+import uvicorn
 from dotenv import load_dotenv
 
 from aurora import db
 
 
 def _cmd_serve(_args: argparse.Namespace) -> int:
-    # T4 substitui pela subida real da API (uvicorn + aurora.api).
-    print("aurora serve: implementação chega na T4 (aurora.api).")
+    uvicorn.run("aurora.api:app", host="0.0.0.0", port=8000)
     return 0
 
 
@@ -39,7 +39,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     serve = subparsers.add_parser(
         "serve",
-        help="Sobe a API em http://localhost:8000 (implementação na T4).",
+        help="Sobe a API em http://localhost:8000.",
     )
     serve.set_defaults(acao=_cmd_serve)
 
