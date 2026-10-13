@@ -90,7 +90,7 @@ def _caminho_banco() -> Path:
     return Path(resto[1:])
 
 
-def _caminho_dados(arquivo: str) -> Path:
+def caminho_dados(arquivo: str) -> Path:
     """Resolve ``dados/<arquivo>``: primeiro no CWD, depois na raiz do projeto."""
     no_cwd = Path.cwd() / "dados" / arquivo
     if no_cwd.exists():
@@ -112,8 +112,8 @@ async def _conectar() -> AsyncIterator[aiosqlite.Connection]:
 
 async def _popular_de_dados(db: aiosqlite.Connection) -> None:
     """Insere os seeds de ``dados/*.json``; transação fica a cargo do chamador."""
-    reservas = json.loads(_caminho_dados("reservas.json").read_text(encoding="utf-8"))
-    visitantes = json.loads(_caminho_dados("visitantes.json").read_text(encoding="utf-8"))
+    reservas = json.loads(caminho_dados("reservas.json").read_text(encoding="utf-8"))
+    visitantes = json.loads(caminho_dados("visitantes.json").read_text(encoding="utf-8"))
     await db.executemany(
         "INSERT INTO reservas (codigo, apartamento, area, data) VALUES (?, ?, ?, ?)",
         [(r["codigo"], r["apartamento"], r["area"], r["data"]) for r in reservas],
