@@ -3,17 +3,19 @@
 Comandos:
 
 - ``aurora serve``: sobe a API em ``http://localhost:8000`` (T4, ``aurora.api``).
-- ``aurora reset``: restaura reservas e visitantes ao estado inicial de
-  ``dados/`` (T2, ``aurora.db``).
-
-Nesta etapa (T1) os comandos apenas registram a chamada; as tarefas donas de
-cada módulo preenchem o comportamento real.
+- ``aurora reset``: restaura reservas, visitantes e contadores ao estado
+  inicial de ``dados/`` (T2, ``aurora.db``). Sessões de conversa são mantidas.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
+
+from dotenv import load_dotenv
+
+from aurora import db
 
 
 def _cmd_serve(_args: argparse.Namespace) -> int:
@@ -23,8 +25,8 @@ def _cmd_serve(_args: argparse.Namespace) -> int:
 
 
 def _cmd_reset(_args: argparse.Namespace) -> int:
-    # T2 substitui pela restauração real dos dados (aurora.db).
-    print("aurora reset: implementação chega na T2 (aurora.db).")
+    asyncio.run(db.reset())
+    print("Banco restaurado ao estado inicial de dados/.")
     return 0
 
 
@@ -43,7 +45,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     reset = subparsers.add_parser(
         "reset",
-        help="Restaura reservas e visitantes ao estado de dados/ (T2).",
+        help="Restaura reservas, visitantes e contadores ao estado de dados/ (T2).",
     )
     reset.set_defaults(acao=_cmd_reset)
 
@@ -52,6 +54,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """Ponto de entrada do comando ``aurora``."""
+    load_dotenv()  # AURORA_DB_URL (e GEMINI_API_KEY na T4) vêm do .env
     args = _build_parser().parse_args(argv)
     return args.acao(args)
 
