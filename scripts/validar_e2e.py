@@ -49,6 +49,50 @@ HOST = os.environ.get("AURORA_HOST", "127.0.0.1")
 PORTA = 8000
 TIMEOUT_HTTP = 240  # invocações com LLM podem levar dezenas de segundos
 
+# Cota free tier do gemini-2.5-flash: 5 requisições/minuto (429 RESOURCE_EXHAUSTED
+# acima disso). Cada turno de conversa faz 1–3 chamadas ao modelo (transferências
+# de agente + tool calls), então o harness espaça os turnos e recupera os 429
+# que ainda escaparem. Configurável: AURORA_PACING_S / AURORA_ESPERA_429_S.
+PACING_S = float(os.environ.get("AURORA_PACING_S", "60"))
+ESPERA_429_S = float(os.environ.get("AURORA_ESPERA_429_S", "65"))
+TENTATIVAS_MENSAGEM = 3
+
+_GATE = threading.Lock()  # serializa turnos entre threads (passo 14 usa threads)
+_ULTIMO_TURNO = [0.0]  # time.monotonic() da última liberação do gate
+RECUPERACOES_429: list[str] = []  # notas de recuperação exibidas no relatório
+
+
+def _eh_rate_limit(status: int, corpo: Any) -> bool:
+    """Detecta o 429 do Gemini encapsulado no 500 da API (``{"detail": ...}``)."""
+    if status != 500:
+        return False
+    texto = json.dumps(corpo, ensure_ascii=False) if corpo is not None else ""
+    return "429" in texto or "RESOURCE_EXHAUSTED" in texto or "quota" in texto.lower()
+
+
+def _eh_cota_diaria(corpo: Any) -> bool:
+    """429 da cota diária (``...PerDay...``) — retry em minutos não resolve."""
+    texto = json.dumps(corpo, ensure_ascii=False) if corpo is not None else ""
+    return "PerDay" in texto
+
+
+def _gate_pacing() -> None:
+    """Espera o espaçamento mínimo desde o último turno liberado."""
+    with _GATE:
+        resto = _ULTIMO_TURNO[0] + PACING_S - time.monotonic()
+        if resto > 0:
+            time.sleep(resto)
+        _ULTIMO_TURNO[0] = time.monotonic()
+
+
+def _esvaziar_janela() -> None:
+    """Espera a janela de cota rolar por completo — antes de rajadas (passo 14)."""
+    with _GATE:
+        resto = _ULTIMO_TURNO[0] + ESPERA_429_S - time.monotonic()
+        if resto > 0:
+            time.sleep(resto)
+        _ULTIMO_TURNO[0] = time.monotonic()
+
 # Marcadores do enunciado
 RSV_1377, RSV_4821, RSV_2950 = "RSV-1377", "RSV-4821", "RSV-2950"
 
@@ -139,17 +183,80 @@ def criar_sessao(apartamento: str) -> tuple[int, str]:
     return status, (corpo or {}).get("session_id", "")
 
 
+def _conversa_com_retry(
+    caminho: str, corpo: dict[str, Any], *, descricao: str, gate: bool = True
+) -> tuple[int, dict[str, Any]]:
+    """POST de conversa com recuperação do 429 (cota free tier do Gemini).
+
+    O 429 chega como 500 da API (``falha na execução do agente: ... 429
+    RESOURCE_EXHAUSTED ...``). A recuperação depende do endpoint:
+
+    - **mensagens**: reenviar o mesmo texto é seguro — o histórico persistido
+      impede execução duplicada de tool (o modelo vê a ação já feita).
+    - **confirmações**: a tool já executou antes da chamada final do LLM e o
+      id foi consumido; reenviar daria ``409`` falso. A recuperação é um
+      turno de acompanhamento na mesma sessão, que fecha o ciclo pela API
+      e devolve o que a conversa real responderia — registrado em
+      ``RECUPERACOES_429`` para o relatório.
+    """
+    eh_confirmacao = caminho.endswith("/confirmacoes")
+    for tentativa in range(1, TENTATIVAS_MENSAGEM + 1):
+        if gate:
+            _gate_pacing()
+        status, resposta = http("POST", caminho, corpo)
+        if not _eh_rate_limit(status, resposta):
+            return status, resposta
+        if _eh_cota_diaria(resposta):
+            RECUPERACOES_429.append(
+                f"{descricao}: cota DIÁRIA do modelo esgotada — retry não"
+                " resolve; reportando falha real do ambiente (trocar de modelo"
+                " via AURORA_MODEL ou aguardar o reset)"
+            )
+            return status, resposta
+        if tentativa == TENTATIVAS_MENSAGEM:
+            break
+        if eh_confirmacao:
+            _esvaziar_janela()
+            status_rec, resposta_rec = _conversa_com_retry(
+                f"/sessoes/{sessao_id_de(caminho)}/mensagens",
+                {
+                    "texto": (
+                        "Obrigado, a resposta anterior já foi registrada."
+                        " Pode encerrar por aqui."
+                    )
+                },
+                descricao=f"recuperação de {descricao}",
+            )
+            RECUPERACOES_429.append(
+                f"{descricao}: 429 após executar a ação — fechada com turno de"
+                " acompanhamento (o id já estava consumido; reenvio daria 409)"
+            )
+            # O turno de acompanhamento fechou o ciclo pela conversa; devolve
+            # o status REAL dele (se a recuperação falhou, o passo falha).
+            return status_rec, resposta_rec
+        time.sleep(ESPERA_429_S)
+    return status, resposta
+
+
+def sessao_id_de(caminho: str) -> str:
+    """/sessoes/<id>/... → <id>"""
+    return caminho.split("/")[2]
+
+
 def enviar_mensagem(sessao: str, texto: str) -> tuple[int, dict[str, Any]]:
-    return http("POST", f"/sessoes/{sessao}/mensagens", {"texto": texto})
+    return _conversa_com_retry(
+        f"/sessoes/{sessao}/mensagens", {"texto": texto}, descricao=f"mensagem em {sessao[:8]}"
+    )
 
 
 def responder_confirmacao(
-    sessao: str, id_: str, confirmado: bool
+    sessao: str, id_: str, confirmado: bool, *, gate: bool = True
 ) -> tuple[int, dict[str, Any]]:
-    return http(
-        "POST",
+    return _conversa_com_retry(
         f"/sessoes/{sessao}/confirmacoes",
         {"id": id_, "confirmado": confirmado},
+        descricao=f"confirmação {id_[:8]} em {sessao[:8]}",
+        gate=gate,
     )
 
 
@@ -376,27 +483,37 @@ _RE_ART = re.compile(r"^\*\*Art\.\s*\d+")
 
 
 def dedos_regulamento(excluir_capitulo: str) -> list[str]:
-    """Substrings literais (~90 chars) de artigos de capítulos que não sejam o excluído."""
+    """Substrings literais (~90 chars) de artigos de capítulos que não sejam o excluído.
+
+    O capítulo de um artigo é o ativo quando o artigo **começa** (um capítulo
+    novo pode surgir no meio do buffer do último artigo do capítulo anterior —
+    ex.: o Art. 28 é o último do Cap. IV e o cabeçalho do Cap. V vem antes do
+    Art. 29; atribuir pelo capítulo corrente no fim do buffer trocaria o
+    capítulo do último artigo de cada capítulo).
+    """
     dedos: list[str] = []
-    capitulo_atual = None
+    capitulo_atual: str | None = None
+    capitulo_do_artigo: str | None = None
     buffer: list[str] = []
+
+    def emitir() -> None:
+        if buffer and capitulo_do_artigo and capitulo_do_artigo != excluir_capitulo:
+            texto = " ".join(" ".join(buffer).split())
+            if len(texto) > 120:
+                dedos.append(texto[15:105])
+
     for linha in (RAIZ / "dados" / "regulamento.md").read_text(encoding="utf-8").splitlines():
         m = _RE_CAP.match(linha)
         if m:
             capitulo_atual = m.group(1)
             continue
         if _RE_ART.match(linha):
-            if buffer and capitulo_atual and capitulo_atual != excluir_capitulo:
-                texto = " ".join(" ".join(buffer).split())
-                if len(texto) > 120:
-                    dedos.append(texto[15:105])
+            emitir()
             buffer = [linha]
+            capitulo_do_artigo = capitulo_atual
         elif buffer:
             buffer.append(linha)
-    if buffer and capitulo_atual and capitulo_atual != excluir_capitulo:
-        texto = " ".join(" ".join(buffer).split())
-        if len(texto) > 120:
-            dedos.append(texto[15:105])
+    emitir()
     return dedos
 
 
@@ -433,6 +550,21 @@ async def _injetar_pendencia(sessao_id: str, area: str, data: str) -> str:
     )
     if sessao is None:
         raise RuntimeError(f"sessão {sessao_id} não encontrada para injeção")
+
+    # Turno de usuário antes do function call: o protocolo da API Gemini exige
+    # que um turno de function call venha imediatamente após um turno de
+    # usuário ("400 INVALID_ARGUMENT: Please ensure that function call turn
+    # comes immediately after a user turn"). No fluxo real a pendência nasce
+    # como resposta a uma mensagem do morador; aqui o turno sintético cumpre
+    # o mesmo papel para a retomada via rota de confirmações.
+    await svc.append_event(
+        sessao,
+        Event(
+            invocation_id=str(uuid.uuid4()),
+            author="user",
+            content=types.Content(role="user", parts=[types.Part(text=f"Reserve a {area} para {data}.")]),
+        ),
+    )
 
     args_tool = {"area": area, "data": data}
     fc_id = f"adk-{uuid.uuid4()}"
@@ -489,8 +621,30 @@ def injetar_pendencia(sessao_id: str, area: str, data: str) -> str:
     return asyncio.run(_injetar_pendencia(sessao_id, area, data))
 
 
+def _pendencia_para_qa(
+    sessao: str, area: str, data: str, tem_modelo: bool
+) -> tuple[str | None, int]:
+    """Cria a pendência de confirmação usada pelos QAs.
+
+    Com modelo: nasce de **conversa real** — o evento ``adk_request_
+    confirmation`` é gerado pelo próprio ADK (o function call carrega o
+    ``thought_signature`` que os modelos Gemini 3.x exigem no histórico; a
+    injeção sintética não o tem e faria a chamada seguinte falhar com 400).
+
+    Sem modelo: injeta o par de eventos no formato exato do ADK 2.9.1 — a
+    tool executa antes da falha do LLM, provando a retomada mesmo sem chave.
+    """
+    if tem_modelo:
+        status, corpo = enviar_mensagem(
+            sessao, f"Reserve a churrasqueira para {data}."
+        )
+        pendentes = (corpo or {}).get("confirmacoes_pendentes") or []
+        return (pendentes[0]["id"] if pendentes else None), status
+    return injetar_pendencia(sessao, area, data), 200
+
+
 def qa_retomada(servidor: Servidor, tem_modelo: bool, resultados: list[Passo]) -> None:
-    """QA-1/QA-2/QA-3: retomada de confirmação sem depender do LLM.
+    """QA-1/QA-2/QA-3: retomada de confirmação (risco nº 1 do desafio).
 
     - QA-1: aprovação executa a ação gravada no evento (uma única vez);
       reenvio do mesmo id → 409 sem reexecutar.
@@ -501,47 +655,53 @@ def qa_retomada(servidor: Servidor, tem_modelo: bool, resultados: list[Passo]) -
 
     # QA-1 — aprovar executa 1x; reenvio 409.
     qa1 = Passo("QA-1", "Retomada: aprovar executa a ação gravada, exatamente 1x")
-    conf = injetar_pendencia(s1, "churrasqueira", "2030-06-01")
-    status, corpo = responder_confirmacao(s1, conf, True)
-    status_esperado = 200 if tem_modelo else 500  # sem chave, a tool roda e o LLM falha depois
-    qa1.check(
-        status == status_esperado,
-        f"resposta da aprovação: {status} (esperado {status_esperado}; sem modelo a tool"
-        " executa e a falha vem depois, na chamada do LLM)",
-    )
-    gravadas = reservas_com("101", "churrasqueira", "2030-06-01")
-    qa1.check(len(gravadas) == 1, f"churrasqueira 2030-06-01 gravada exatamente 1x ({gravadas})")
-    status, _ = responder_confirmacao(s1, conf, True)
-    qa1.check(status == 409, f"reenvio da mesma confirmação → 409 (veio {status})")
-    gravadas = reservas_com("101", "churrasqueira", "2030-06-01")
-    qa1.check(len(gravadas) == 1, "reenvio não reexecutou a ação")
+    conf, status_msg = _pendencia_para_qa(s1, "churrasqueira", "2030-06-01", tem_modelo)
+    qa1.check(conf is not None, f"pendência criada (status da mensagem: {status_msg})")
+    if conf:
+        status, corpo = responder_confirmacao(s1, conf, True)
+        status_esperado = 200 if tem_modelo else 500  # sem chave, a tool roda e o LLM falha depois
+        qa1.check(
+            status == status_esperado,
+            f"resposta da aprovação: {status} (esperado {status_esperado}; sem modelo a tool"
+            " executa e a falha vem depois, na chamada do LLM)",
+        )
+        gravadas = reservas_com("101", "churrasqueira", "2030-06-01")
+        qa1.check(len(gravadas) == 1, f"churrasqueira 2030-06-01 gravada exatamente 1x ({gravadas})")
+        status, _ = responder_confirmacao(s1, conf, True)
+        qa1.check(status == 409, f"reenvio da mesma confirmação → 409 (veio {status})")
+        gravadas = reservas_com("101", "churrasqueira", "2030-06-01")
+        qa1.check(len(gravadas) == 1, "reenvio não reexecutou a ação")
     resultados.append(qa1)
 
     # QA-2 — negar não grava.
     qa2 = Passo("QA-2", "Retomada: negar não grava nada")
-    conf = injetar_pendencia(s1, "churrasqueira", "2030-06-02")
-    status, _ = responder_confirmacao(s1, conf, False)
-    status_esperado = 200 if tem_modelo else 500
-    qa2.check(status == status_esperado, f"resposta da negação: {status} (esperado {status_esperado})")
-    qa2.check(
-        reservas_com("101", "churrasqueira", "2030-06-02") == [],
-        "negação não gravou reserva",
-    )
+    conf, status_msg = _pendencia_para_qa(s1, "churrasqueira", "2030-06-02", tem_modelo)
+    qa2.check(conf is not None, f"pendência criada (status da mensagem: {status_msg})")
+    if conf:
+        status, _ = responder_confirmacao(s1, conf, False)
+        status_esperado = 200 if tem_modelo else 500
+        qa2.check(status == status_esperado, f"resposta da negação: {status} (esperado {status_esperado})")
+        qa2.check(
+            reservas_com("101", "churrasqueira", "2030-06-02") == [],
+            "negação não gravou reserva",
+        )
     resultados.append(qa2)
 
     # QA-3 — pendência atravessa o reinício.
     qa3 = Passo("QA-3", "Retomada: pendência aprovável depois de reiniciar a API")
-    conf = injetar_pendencia(s1, "churrasqueira", "2030-06-03")
-    servidor.parar_com_ctrl_c()
-    servidor.subir()
-    # Se a pendência não tivesse sobrevivido ao reinício, a aprovação daria 409.
-    status, _ = responder_confirmacao(s1, conf, True)
-    ok_status = status == (200 if tem_modelo else 500)
-    qa3.check(ok_status, f"aprovação pós-reinício aceita (status {status}; 409 indicaria perda)")
-    qa3.check(
-        len(reservas_com("101", "churrasqueira", "2030-06-03")) == 1,
-        "ação gravada no evento executada após o reinício",
-    )
+    conf, status_msg = _pendencia_para_qa(s1, "churrasqueira", "2030-06-03", tem_modelo)
+    qa3.check(conf is not None, f"pendência criada antes do reinício (status: {status_msg})")
+    if conf:
+        servidor.parar_com_ctrl_c()
+        servidor.subir()
+        # Se a pendência não tivesse sobrevivido ao reinício, a aprovação daria 409.
+        status, _ = responder_confirmacao(s1, conf, True)
+        ok_status = status == (200 if tem_modelo else 500)
+        qa3.check(ok_status, f"aprovação pós-reinício aceita (status {status}; 409 indicaria perda)")
+        qa3.check(
+            len(reservas_com("101", "churrasqueira", "2030-06-03")) == 1,
+            "ação gravada no evento executada após o reinício",
+        )
     resultados.append(qa3)
 
 
@@ -731,8 +891,9 @@ def fluxo_completo(servidor: Servidor, resultados: list[Passo]) -> dict[str, Any
     resposta = (corpo or {}).get("resposta", "")
     p.check("20h" in resposta, f"resposta traz o fechamento de domingo (20h): {resposta[:120]!r}")
     eventos = eventos_da_sessao(s1)
+    # eventos vêm da API como model_dump(mode="json") — chaves snake_case
     tem_tool = any(
-        parte.get("functionCall")
+        parte.get("function_call")
         for ev in eventos
         for parte in (ev.get("content", {}) or {}).get("parts", [])
     )
@@ -795,12 +956,16 @@ def fluxo_completo(servidor: Servidor, resultados: list[Passo]) -> dict[str, Any
     p.check(len(pend4["lista"]) == 1, "S4 com confirmação pendente")
 
     if pend3["lista"] and pend4["lista"]:
+        # Esvazia a janela de cota: as duas aprovações precisam disparar
+        # simultâneas de verdade (é o que o passo 14 testa — o `curl &` do
+        # avaliador); 429 aqui derrotaria o propósito da disputa.
+        _esvaziar_janela()
         barreira = threading.Barrier(2)
         saidas: dict[str, tuple[int, Any]] = {}
 
         def aprovar(nome: str, sessao: str, id_: str) -> None:
             barreira.wait()
-            saidas[nome] = responder_confirmacao(sessao, id_, True)
+            saidas[nome] = responder_confirmacao(sessao, id_, True, gate=False)
 
         linhas = [
             threading.Thread(target=aprovar, args=("s3", s3, pend3["lista"][0]["id"])),
@@ -930,6 +1095,11 @@ def imprimir(resultados: list[Passo]) -> None:
     }
     print("=" * 72)
     print(f"RESUMO: {resumo[OK]} OK · {resumo[FAIL]} FAIL · {resumo[BLOCKED]} BLOCKED")
+    if RECUPERACOES_429:
+        print()
+        print(f"RECUPERAÇÕES DE COTA (429, free tier 5 req/min): {len(RECUPERACOES_429)}")
+        for nota in RECUPERACOES_429:
+            print(f"  - {nota}")
 
 
 if __name__ == "__main__":
