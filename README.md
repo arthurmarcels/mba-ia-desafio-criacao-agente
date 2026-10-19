@@ -22,6 +22,7 @@ O assistente é construído com Google ADK em torno de uma decisão estrutural: 
                          ┌─────────────┐ ┌────────────────────┐
                          │ especialista│ │ especialista       │  tools de LEITURA (só aqui):
                          │ _reservas   │ │ _regulamento       │  listar_minhas_reservas ·
+                         │             │ │                    │  listar_meus_visitantes ·
                          │             │ │                    │  verificar_disponibilidade ·
                          └─────────────┘ └────────────────────┘  consultar_regulamento
 ```
@@ -33,7 +34,7 @@ Definição em `aurora/agents.py` (`root_agent`, `especialista_reservas`, `espec
 | Agente | Responsabilidade | Como é acionado | Por quê |
 |---|---|---|---|
 | **`aurora` (principal)** | Conduz a conversa do início ao fim e executa **toda ação de escrita**: reservar, cancelar, autorizar visitante. | É o root — recebe a mensagem do morador via Runner. | O evento `adk_request_confirmation` tem como autor o agente que chamou a tool. Mantendo toda escrita no root, **a retomada da confirmação sempre volta ao agente certo**, mesmo com sessão persistida e pós-reinício. Além disso, o principal não carrega uma linha do regulamento nas instruções (Garantia 4): só sabe que dúvidas de regra vão ao especialista. |
-| **`especialista_reservas`** | Consultas de agenda: listar as reservas do apartamento da sessão e verificar se uma área está livre numa data. | Transferência automática pelo principal (`sub_agents`), conforme a instrução. | Especialistas de leitura isolam o contexto: a consulta de disponibilidade devolve apenas `{"livre": bool}` — sem dono, código ou dados de outra unidade (Garantia 2). |
+| **`especialista_reservas`** | Consultas de agenda: listar as reservas e os visitantes autorizados do apartamento da sessão e verificar se uma área está livre numa data. | Transferência automática pelo principal (`sub_agents`), conforme a instrução. | Especialistas de leitura isolam o contexto: a consulta de disponibilidade devolve apenas `{"livre": bool}` — sem dono, código ou dados de outra unidade (Garantia 2). |
 | **`especialista_regulamento`** | Dúvidas sobre o regulamento interno, respondidas **somente** a partir da tool `consultar_regulamento`. | Transferência automática pelo principal (`sub_agents`). | O regulamento é longo; consultá-lo por trecho em um subagente impede que o texto inteiro entre no histórico da sessão e encareça cada mensagem seguinte (Garantia 4). |
 
 ### Fluxo de uma mensagem
@@ -59,7 +60,7 @@ Cada garantia, o arquivo e o trecho que a implementam, e por que não depende do
 
 ### Garantia 2 — Cada sessão pertence a um apartamento
 
-- **Onde:** `aurora/tools.py` — **nenhuma tool tem `apartamento` na assinatura** (`criar_reserva(area, data)`, `cancelar_reserva(area, data)`, `autorizar_visitante(nome, data)`, `listar_minhas_reservas()`, `verificar_disponibilidade(area, data)`). O valor vem sempre de `_apartamento_da_sessao(tool_context)` (linhas 64–72), que lê `tool_context.session.state["apartamento"]`.
+- **Onde:** `aurora/tools.py` — **nenhuma tool tem `apartamento` na assinatura** (`criar_reserva(area, data)`, `cancelar_reserva(area, data)`, `autorizar_visitante(nome, data)`, `listar_minhas_reservas()`, `listar_meus_visitantes()`, `verificar_disponibilidade(area, data)`). O valor vem sempre de `_apartamento_da_sessao(tool_context)` (linhas 64–72), que lê `tool_context.session.state["apartamento"]`.
 - **Estado da sessão:** `aurora/api.py`, `criar_sessao` (linhas 87–99) grava `state={"apartamento": apartamento}` **uma única vez** na criação.
 - **Vazamento:** `verificar_disponibilidade` (tools.py, linhas 143–156) devolve só `{"livre": bool}`; conflito em `criar_reserva` devolve erro sem revelar de quem é a reserva (`aurora/db.py`, `_ERRO_DATA_OCUPADA`).
 - **Por que não depende do modelo:** o parâmetro não existe, então o modelo não tem como escolher — e prompt injection que "muda" o apartamento não altera o state da sessão. "Sou do 302" numa sessão do 101 continua operando sobre o 101.

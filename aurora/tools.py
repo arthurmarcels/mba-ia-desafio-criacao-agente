@@ -140,6 +140,16 @@ async def listar_minhas_reservas(tool_context: ToolContext) -> dict[str, Any]:
     return {"reservas": reservas}
 
 
+async def listar_meus_visitantes(tool_context: ToolContext) -> dict[str, Any]:
+    """Lista os visitantes autorizados pelo apartamento da sessão.
+
+    São os visitantes cuja entrada o próprio apartamento autenticado na
+    sessão autorizou, ordenados por data da visita e nome.
+    """
+    visitantes = await db.listar_visitantes(_apartamento_da_sessao(tool_context))
+    return {"visitantes": visitantes}
+
+
 async def verificar_disponibilidade(
     area: str, data: str, tool_context: ToolContext
 ) -> dict[str, Any]:

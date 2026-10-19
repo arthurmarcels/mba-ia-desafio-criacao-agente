@@ -19,6 +19,7 @@ from google.adk.agents import LlmAgent
 
 from aurora.regulamento import consultar_regulamento
 from aurora.tools import (
+    listar_meus_visitantes,
     listar_minhas_reservas,
     tool_autorizar_visitante,
     tool_cancelar_reserva,
@@ -39,7 +40,8 @@ Sua responsabilidade:
   as suas próprias tools: reservar área comum, cancelar reserva própria e
   autorizar visitante.
 - Transferir ao especialista_reservas as consultas: listar as reservas do
-  morador e verificar se uma área está livre numa data.
+  morador, listar os visitantes autorizados do morador e verificar se uma
+  área está livre numa data.
 - Transferir ao especialista_regulamento toda dúvida sobre o regulamento
   interno do condomínio. Você não responde regra de memória: o regulamento
   é consultado pelo especialista, e o que ele devolver é a única fonte.
@@ -61,6 +63,8 @@ consulta chamado pelo agente principal. Você atende apenas leituras com as
 suas tools:
 
 - listar_minhas_reservas: as reservas ativas do apartamento da sessão.
+- listar_meus_visitantes: os visitantes autorizados pelo apartamento da
+  sessão, ordenados por data da visita e nome.
 - verificar_disponibilidade: se uma área comum está livre numa data; o
   resultado é apenas livre ou ocupada, sem dizer de quem é a reserva.
 
@@ -89,11 +93,12 @@ especialista_reservas = LlmAgent(
     name="especialista_reservas",
     model=_MODELO,
     description=(
-        "Especialista em reservas: lista as reservas do morador e verifica"
-        " disponibilidade de áreas comuns por data."
+        "Especialista em reservas: lista as reservas e os visitantes"
+        " autorizados do morador e verifica disponibilidade de áreas comuns"
+        " por data."
     ),
     instruction=_INSTRUCAO_RESERVAS,
-    tools=[listar_minhas_reservas, verificar_disponibilidade],
+    tools=[listar_minhas_reservas, listar_meus_visitantes, verificar_disponibilidade],
 )
 
 especialista_regulamento = LlmAgent(
